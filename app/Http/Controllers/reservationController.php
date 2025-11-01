@@ -8,19 +8,61 @@ use App\Models\booking;
 use App\Models\roomCategory;
 use App\Models\availability;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\ValidationException;
+use Illuminate\Database\QueryException;
 
 class reservationController extends Controller
 {
-    public function index(){
+    public function index(Request $request){
         $categories = roomCategory::all();
-        $checkIn = Carbon::today()->format('Y-m-d');
-        $checkOut = Carbon::tomorrow()->format('Y-m-d');
-        return view('checkAvailable', [
-            'categories' => $categories,
-            'checkIn' => $checkIn,
-            'checkOut' => $checkOut,
-        ]);
-    }
+
+        $availability = [];
+
+        // Only run validation and calculate availability if the user submitted the form
+        if ($request->has('check_in') && $request->has('check_out')) {
+            $today = Carbon::today()->format('Y-m-d');
+
+            $validated = $request->validate([
+                'check_in'  => ['required', 'date', 'date_format:Y-m-d', "after_or_equal:$today"],
+                'check_out' => ['required', 'date', 'date_format:Y-m-d', 'after:check_in'],
+            ], [
+                'check_in.after_or_equal' => 'Can not choose past date for check-in.',
+                'check_out.after' => 'Check-out date must be after check-in date.',
+            ]);
+
+            $from = Carbon::parse($validated['check_in']);
+            $to   = Carbon::parse($validated['check_out']);
+
+            $bookingData = [
+                'check_in_date'  => $from->toDateString(),
+                'check_out_date' => $to->toDateString(),
+            ];
+
+            // Check room availability
+            foreach ($categories as $category) {
+                $room  = $this->getAvailableRoom($category->id, $from, $to);
+                $price = $category->calculateTotalPrice($from, $to);
+
+                $availability[] = [
+                    'category'  => $category,
+                    'available' => $room ? true : false,
+                    'price'     => $price,
+                ];
+            }
+        }
+        else{
+            $bookingData = [];
+        }
+
+
+    return view('reservation', [
+        'categories'   => $categories,
+        'bookingData'  => $bookingData,
+        'availability' => $availability,
+    ]);
+}
+
 
     public function validateBooking(Request $request){
 
@@ -28,9 +70,9 @@ class reservationController extends Controller
         return $request->validate([
             'name'=>'required|string|max:255',
             'email'=>'required|email',
-            'phone'=>['required','regex:/^01[0-9]{9}+$/','max:20'], // regex for BD numbers
-            'check_in_date'=>['required','date',"after_or_equal:$today"],
-            'check_out_date'=>['required','date','after:check_in_date'],
+            'phone'=>['required','regex:/^(?:\+?8801|01)[0-9]{9}$/','max:20'], // BD numbers: 01XXXXXXXXX or +8801XXXXXXXXX
+            'check_in_date'=>['required','date','date_format:Y-m-d',"after_or_equal:$today"],
+            'check_out_date'=>['required','date','date_format:Y-m-d','after:check_in_date'],
             'category_id'=>'required|exists:room_categories,id',
         ],
         [
@@ -72,15 +114,33 @@ class reservationController extends Controller
     }
 
     public function checkAvailability(Request $request){
+        Log::info('checkAvailability called', [
+            'query' => $request->query(),
+            'input' => $request->all()
+        ]);
         // Validate only the search fields used by the form
         $today = Carbon::today()->format('Y-m-d');
-        $validated = $request->validate([
-            'check_in'  => ['required', 'date', "after_or_equal:$today"],
-            'check_out' => ['required', 'date', 'after:check_in'],
-        ], [
-            'check_in.after_or_equal' => 'Can not choose past date for check-in.',
-            'check_out.after' => 'Check-out date must be after check-in date.',
-        ]);
+
+        try {
+            $validated = $request->validate([
+                'check_in'  => ['required', 'date', 'date_format:Y-m-d', "after_or_equal:$today"],
+                'check_out' => ['required', 'date', 'date_format:Y-m-d', 'after:check_in'],
+            ], [
+                'check_in.after_or_equal' => 'Can not choose past date for check-in.',
+                'check_out.after' => 'Check-out date must be after check-in date.',
+            ]);
+            Log::info('checkAvailability validation passed', [
+                'validated' => $validated,
+                'today' => $today,
+            ]);
+        } catch (ValidationException $e) {
+            Log::warning('checkAvailability validation failed', [
+                'errors' => $e->errors(),
+                'input' => $request->all(),
+                'today' => $today,
+            ]);
+            throw $e;
+        }
 
         $from = Carbon::parse($validated['check_in']);
         $to   = Carbon::parse($validated['check_out']);
@@ -103,6 +163,11 @@ class reservationController extends Controller
             'check_in_date'  => $from->toDateString(),
             'check_out_date' => $to->toDateString(),
         ];
+        Log::info('checkAvailability returning view', [
+            'from' => $from->toDateString(),
+            'to' => $to->toDateString(),
+            'availability_count' => count($availability),
+        ]);
 
         return view('reservation', [
             'availability' => $availability,
@@ -114,7 +179,22 @@ class reservationController extends Controller
     }
 
     public function confirmBooking(Request $request){
-        $validated = $this->validateBookingInput($request);
+        Log::info('confirmBooking called', [
+            'input' => $request->all()
+        ]);
+
+        try {
+            $validated = $this->validateBooking($request);
+            Log::info('confirmBooking validation passed', [
+                'validated' => $validated,
+            ]);
+        } catch (ValidationException $e) {
+            Log::warning('confirmBooking validation failed', [
+                'errors' => $e->errors(),
+                'input'  => $request->all(),
+            ]);
+            throw $e;
+        }
 
         $category = roomCategory::findOrFail($request->category_id);
         $from = Carbon::parse($validated['check_in_date']);
@@ -123,26 +203,49 @@ class reservationController extends Controller
         $room = $this->getAvailableRoom($category->id, $from, $to);
 
         if(!$room){
-            return back()->withErrors(['error'=>'No available rooms in the selected category for the chosen dates. Please select different dates or category.']);
+            Log::warning('confirmBooking no available room', [
+                'category_id' => $category->id,
+                'from' => $from->toDateString(),
+                'to' => $to->toDateString()
+            ]);
+            return back()
+                ->withErrors(['error'=>'No available rooms in the selected category for the chosen dates. Please select different dates or category.'])
+                ->withInput();
         }
 
         $total = $category->calculateTotalPrice($from, $to);
 
-        $booking = booking::create([
-            'name'=>$validated['name'],
-            'email'=>$validated['email'],
-            'phone'=>$validated['phone'],
-            'room_id'=>$room->id,
-            'check_in_date'=>$from->toDateString(),
-            'check_out_date'=>$to->toDateString(),
-            'total_price'=>$total,
-        ]);
+        try {
+            $booking = booking::create([
+                'name'           => $validated['name'],
+                'email'          => $validated['email'],
+                'phone_number'   => $validated['phone'],
+                'room_id'        => $room->id,
+                'check_in_date'  => $from->toDateString(),
+                'check_out_date' => $to->toDateString(),
+                'total_price'    => $total,
+            ]);
+        } catch (QueryException $e) {
+            Log::error('confirmBooking DB error', [
+                'message'  => $e->getMessage(),
+                'sql'      => method_exists($e, 'getSql') ? $e->getSql() : null,
+                'bindings' => method_exists($e, 'getBindings') ? $e->getBindings() : null,
+            ]);
+            return back()
+                ->withErrors(['error' => 'Could not complete booking at this time. Please review your inputs and try again.'])
+                ->withInput();
+        }
 
+        // Keep explicit marking; Booking model also marks on created event
         availability::markAsBooked($room->id, $from, $to);
 
         $room->update(['status'=>'booked']);
 
-        return redirect()->route('booking.success')->with('id', $booking->id);
+        Log::info('confirmBooking created booking', [
+            'booking_id' => $booking->id
+        ]);
+
+        return redirect()->route('booking.success', ['id' => $booking->id]);
     }
 
     public function bookingSuccess($id)

@@ -44,13 +44,13 @@ class availability extends Model
 
     public static function isAvailableForRange($roomId, $checkIn, $checkOut)
     {
-        return self::where('room_id', $roomId)
+        return !self::where('room_id', $roomId)
             ->whereBetween('date', [
                 Carbon::parse($checkIn),
                 Carbon::parse($checkOut)->subDay()
             ])
             ->where('is_available', false)
-            ->doesntExist();
+            ->exists();
     }
 
 
@@ -64,7 +64,7 @@ class availability extends Model
 
         foreach ($period as $date) {
             self::updateOrCreate(
-                ['room_id' => $roomId, 'date' => $date->toDateString()],
+                ['room_id' => $roomId, 'date' => $date->format('Y-m-d')],
                 ['is_available' => false]
             );
         }
@@ -81,7 +81,7 @@ class availability extends Model
 
         foreach ($period as $date) {
             self::updateOrCreate(
-                ['room_id' => $roomId, 'date' => $date->toDateString()],
+                ['room_id' => $roomId, 'date' => $date->format('Y-m-d')],
                 ['is_available' => true]
             );
         }
